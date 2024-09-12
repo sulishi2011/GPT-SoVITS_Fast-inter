@@ -137,11 +137,23 @@ argv = sys.argv
 
 APP = FastAPI()
 
+# 建立一个Speaker类，用于存储每个speaker的信息  
+class Speaker:
+    def __init__(self, name, gpt_weights, sovits_weights, ref_audio_path, prompt_text="", prompt_lang=""):
+        self.name = name
+        self.gpt_weights = gpt_weights
+        self.sovits_weights = sovits_weights
+        self.ref_audio_path = ref_audio_path
+        self.prompt_text = prompt_text
+        self.prompt_lang = prompt_lang
+        self.tts_instance = None
+
+speakers = {}
 
 class TTS_Request(BaseModel):
-    text: str = None
-    text_lang: str = None
-    ref_audio_path: str = None
+    speaker_name: str
+    text: str
+    text_lang: str
     prompt_lang: str = None
     prompt_text: str = ""
     top_k: int = 5
@@ -158,13 +170,18 @@ class TTS_Request(BaseModel):
     streaming_mode: bool = False
     parallel_infer: bool = True
     repetition_penalty: float = 1.35
+    tts_infer_yaml_path: str = None
     """推理时需要加载的声音模型的yaml配置文件路径，如：GPT_SoVITS/configs/tts_infer.yaml"""
 
 
 @lru_cache(maxsize=10)
-def get_tts_instance(tts_config: TTS_Config) -> TTS:
-    print(f"load tts config from {tts_config.configs_path}")
-    return TTS(tts_config)
+def get_tts_instance(tts_config: TTS_Config, speaker: Speaker) -> TTS:
+    print(f"Loading TTS instance for speaker: {speaker.name}")
+    tts_instance = TTS(tts_config)
+    tts_instance.init_t2s_weights(speaker.gpt_weights)
+    tts_instance.init_vits_weights(speaker.sovits_weights)
+    tts_instance.set_ref_audio(speaker.ref_audio_path)
+    return tts_instance
 
 
 def pack_ogg(io_buffer: BytesIO, data: np.ndarray, rate: int):
@@ -304,6 +321,17 @@ async def tts_handle(req: dict):
         StreamingResponse: audio stream response.
     """
 
+    speaker_name = req.get("speaker_name")
+    if speaker_name not in speakers:
+        return JSONResponse(status_code=400, content={"message": f"Speaker {speaker_name} not found"})
+    
+    speaker = speakers[speaker_name]
+    tts_instance = speaker.tts_instance
+
+    req["prompt_text"] = req.get("prompt_text", speaker.prompt_text)
+    req["prompt_lang"] = req.get("prompt_lang", speaker.prompt_lang)
+    req["ref_audio_path"] = speaker.ref_audio_path
+
     streaming_mode = req.get("streaming_mode", False)
     media_type = req.get("media_type", "wav")
     tts_infer_yaml_path = req.get("tts_infer_yaml_path", "GPT_SoVITS/configs/tts_infer.yaml")
@@ -317,10 +345,6 @@ async def tts_handle(req: dict):
         req["return_fragment"] = True
 
     try:
-        tts_instance = get_tts_instance(tts_config)
-
-        move_to_original(tts_instance, tts_config)
-
         tts_generator = tts_instance.run(req)
 
         if streaming_mode:
@@ -330,15 +354,13 @@ async def tts_handle(req: dict):
                     media_type = "raw"
                 for sr, chunk in tts_generator:
                     yield pack_audio(BytesIO(), chunk, sr, media_type).getvalue()
-                move_to_cpu(tts_instance)
 
             # _media_type = f"audio/{media_type}" if not (streaming_mode and media_type in ["wav", "raw"]) else f"audio/x-{media_type}"
-            return StreamingResponse(streaming_generator(tts_generator, media_type, ), media_type=f"audio/{media_type}")
+            return StreamingResponse(streaming_generator(tts_generator, media_type), media_type=f"audio/{media_type}")
 
         else:
             sr, audio_data = next(tts_generator)
             audio_data = pack_audio(BytesIO(), audio_data, sr, media_type).getvalue()
-            move_to_cpu(tts_instance)
             return Response(audio_data, media_type=f"audio/{media_type}")
     except Exception as e:
         return JSONResponse(status_code=400, content={"message": f"tts failed", "Exception": str(e)})
@@ -458,6 +480,24 @@ async def set_sovits_weights(weights_path: str = None, tts_infer_yaml_path: str 
         return JSONResponse(status_code=400, content={"message": f"change sovits weight failed", "Exception": str(e)})
     return JSONResponse(status_code=200, content={"message": "success"})
 
+@APP.post("/register_speaker")
+async def register_speaker(
+    name: str,
+    gpt_weights: str,
+    sovits_weights: str,
+    ref_audio_path: str,
+    prompt_text: str = "",
+    prompt_lang: str = "",
+    tts_infer_yaml_path: str = "GPT_SoVITS/configs/tts_infer.yaml"
+):
+    try:
+        speaker = Speaker(name, gpt_weights, sovits_weights, ref_audio_path, prompt_text, prompt_lang)
+        tts_config = TTS_Config(tts_infer_yaml_path)
+        speaker.tts_instance = get_tts_instance(tts_config, speaker)
+        speakers[name] = speaker
+        return JSONResponse(status_code=200, content={"message": f"Speaker {name} registered successfully"})
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"message": f"Failed to register speaker", "Exception": str(e)})
 
 if __name__ == "__main__":
     try:
