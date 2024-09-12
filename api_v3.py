@@ -158,7 +158,6 @@ class TTS_Request(BaseModel):
     streaming_mode: bool = False
     parallel_infer: bool = True
     repetition_penalty: float = 1.35
-    tts_infer_yaml_path: str = None
     """推理时需要加载的声音模型的yaml配置文件路径，如：GPT_SoVITS/configs/tts_infer.yaml"""
 
 
